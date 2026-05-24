@@ -22,9 +22,31 @@ import os
 # Windows API 声明
 # =============================================
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+advapi32 = ctypes.WinDLL('advapi32', use_last_error=True)
 
 PROCESS_VM_READ = 0x0010
 PROCESS_QUERY_INFORMATION = 0x0400
+TOKEN_ADJUST_PRIVILEGES = 0x0020
+TOKEN_QUERY = 0x0008
+SE_PRIVILEGE_ENABLED = 0x00000002
+
+class TOKEN_PRIVILEGES(ctypes.Structure):
+    _fields_ = [
+        ("PrivilegeCount", wintypes.DWORD),
+        ("Privileges", wintypes.LUID_AND_ATTRIBUTES * 1),
+    ]
+
+class LUID(ctypes.Structure):
+    _fields_ = [
+        ("LowPart", wintypes.DWORD),
+        ("HighPart", wintypes.LONG),
+    ]
+
+class LUID_AND_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Luid", LUID),
+        ("Attributes", wintypes.DWORD),
+    ]
 
 OpenProcess = kernel32.OpenProcess
 OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -37,6 +59,22 @@ CloseHandle.restype = wintypes.BOOL
 ReadProcessMemory = kernel32.ReadProcessMemory
 ReadProcessMemory.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.LPVOID, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
 ReadProcessMemory.restype = wintypes.BOOL
+
+OpenProcessToken = advapi32.OpenProcessToken
+OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+OpenProcessToken.restype = wintypes.BOOL
+
+LookupPrivilegeValueA = advapi32.LookupPrivilegeValueA
+LookupPrivilegeValueA.argtypes = [wintypes.LPCSTR, wintypes.LPCSTR, ctypes.POINTER(LUID)]
+LookupPrivilegeValueA.restype = wintypes.BOOL
+
+AdjustTokenPrivileges = advapi32.AdjustTokenPrivileges
+AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES), wintypes.DWORD, ctypes.POINTER(TOKEN_PRIVILEGES), ctypes.POINTER(wintypes.DWORD)]
+AdjustTokenPrivileges.restype = wintypes.BOOL
+
+GetCurrentProcess = kernel32.GetCurrentProcess
+GetCurrentProcess.argtypes = []
+GetCurrentProcess.restype = wintypes.HANDLE
 
 FindWindowA = ctypes.windll.user32.FindWindowA
 FindWindowA.argtypes = [wintypes.LPCSTR, wintypes.LPCSTR]
@@ -53,6 +91,39 @@ EnumProcessModules.restype = wintypes.BOOL
 GetModuleBaseNameA = ctypes.windll.psapi.GetModuleBaseNameA
 GetModuleBaseNameA.argtypes = [wintypes.HANDLE, wintypes.HMODULE, wintypes.LPCSTR, wintypes.DWORD]
 GetModuleBaseNameA.restype = wintypes.DWORD
+
+
+def enable_debug_privilege():
+    hToken = wintypes.HANDLE()
+    hProcess = GetCurrentProcess()
+    if not OpenProcessToken(hProcess, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ctypes.byref(hToken)):
+        print(f"  [!] OpenProcessToken 失败: Error={ctypes.get_last_error()}")
+        return False
+
+    luid = LUID()
+    if not LookupPrivilegeValueA(None, b"SeDebugPrivilege", ctypes.byref(luid)):
+        print(f"  [!] LookupPrivilegeValue 失败: Error={ctypes.get_last_error()}")
+        CloseHandle(hToken)
+        return False
+
+    tp = TOKEN_PRIVILEGES()
+    tp.PrivilegeCount = 1
+    tp.Privileges[0].Luid = luid
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+
+    if not AdjustTokenPrivileges(hToken, False, ctypes.byref(tp), 0, None, None):
+        print(f"  [!] AdjustTokenPrivileges 失败: Error={ctypes.get_last_error()}")
+        CloseHandle(hToken)
+        return False
+
+    err = ctypes.get_last_error()
+    CloseHandle(hToken)
+
+    if err != 0:
+        print(f"  [!] AdjustTokenPrivileges 返回错误: Error={err}")
+        return False
+
+    return True
 
 # =============================================
 # 游戏版本配置 - 根据你的游戏版本选择或修改
@@ -184,6 +255,12 @@ def read_xor_value(handle, address):
 # 查找游戏进程
 # =============================================
 def find_game_process(config):
+    print(f"  正在启用调试权限...")
+    if enable_debug_privilege():
+        print(f"  调试权限已启用")
+    else:
+        print(f"  调试权限启用失败，继续尝试...")
+
     hwnd = FindWindowA(config["window_class"].encode('gbk'), None)
     if not hwnd:
         hwnd = FindWindowA(config["window_class"].encode('utf-8'), None)
@@ -199,19 +276,28 @@ def find_game_process(config):
 
     handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, False, pid)
     if not handle:
-        print(f"  无法打开进程 (PID={pid}, Error={ctypes.get_last_error()})")
-        print(f"  请以管理员身份运行此脚本")
+        err = ctypes.get_last_error()
+        print(f"  OpenProcess 失败 (PID={pid}, Error={err})，尝试仅 VM_READ...")
+        handle = OpenProcess(PROCESS_VM_READ, False, pid)
+    if not handle:
+        err = ctypes.get_last_error()
+        print(f"  仍然无法打开进程 (Error={err})")
+        print(f"  请确认以管理员身份运行此脚本")
         return None, None, None
 
     hModules = (wintypes.HMODULE * 1024)()
     cbNeeded = wintypes.DWORD()
-    EnumProcessModules(handle, hModules, ctypes.sizeof(hModules), ctypes.byref(cbNeeded))
+    base_addr = None
 
-    base_addr = hModules[0]
-
-    modName = ctypes.create_string_buffer(260)
-    GetModuleBaseNameA(handle, base_addr, modName, 260)
-    exe_name = modName.value.decode('latin-1', errors='replace')
+    if EnumProcessModules(handle, hModules, ctypes.sizeof(hModules), ctypes.byref(cbNeeded)):
+        base_addr = hModules[0]
+        modName = ctypes.create_string_buffer(260)
+        GetModuleBaseNameA(handle, base_addr, modName, 260)
+        exe_name = modName.value.decode('latin-1', errors='replace')
+        print(f"  游戏模块: {exe_name}, 基址: 0x{base_addr:X}")
+    else:
+        print(f"  EnumProcessModules 失败，使用默认基址 0x400000")
+        base_addr = 0x400000
 
     return handle, pid, base_addr
 
