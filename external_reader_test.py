@@ -30,12 +30,6 @@ TOKEN_ADJUST_PRIVILEGES = 0x0020
 TOKEN_QUERY = 0x0008
 SE_PRIVILEGE_ENABLED = 0x00000002
 
-class TOKEN_PRIVILEGES(ctypes.Structure):
-    _fields_ = [
-        ("PrivilegeCount", wintypes.DWORD),
-        ("Privileges", wintypes.LUID_AND_ATTRIBUTES * 1),
-    ]
-
 class LUID(ctypes.Structure):
     _fields_ = [
         ("LowPart", wintypes.DWORD),
@@ -46,6 +40,12 @@ class LUID_AND_ATTRIBUTES(ctypes.Structure):
     _fields_ = [
         ("Luid", LUID),
         ("Attributes", wintypes.DWORD),
+    ]
+
+class TOKEN_PRIVILEGES(ctypes.Structure):
+    _fields_ = [
+        ("PrivilegeCount", wintypes.DWORD),
+        ("Privileges", LUID_AND_ATTRIBUTES * 1),
     ]
 
 OpenProcess = kernel32.OpenProcess
