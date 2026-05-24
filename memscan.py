@@ -175,7 +175,7 @@ def main():
     print(f"\n  扫描进程内存区域...")
 
     regions = []
-    addr = 0
+    addr = 0x10000
     max_addr = 0x7FFFFFFF
 
     while addr < max_addr:
@@ -183,9 +183,13 @@ def main():
         result = VirtualQueryEx(handle, addr, ctypes.byref(mbi), ctypes.sizeof(mbi))
         if result == 0:
             break
+        base = mbi.BaseAddress if mbi.BaseAddress is not None else addr
+        size = mbi.RegionSize
         if mbi.State == MEM_COMMIT and is_readable(mbi.Protect):
-            regions.append((mbi.BaseAddress, mbi.RegionSize))
-        addr = mbi.BaseAddress + mbi.RegionSize
+            regions.append((base, size))
+        if size == 0:
+            break
+        addr = base + size
 
     total_size = sum(s for _, s in regions)
     print(f"  找到 {len(regions)} 个可读区域, 总大小: {total_size // 1024 // 1024}MB")
