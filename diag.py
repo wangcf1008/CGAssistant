@@ -263,7 +263,7 @@ def main():
                 raw_int = read_int(handle, addr)
                 print(f"  {name}")
                 print(f"    地址: 0x{addr:X}, 原始int: {raw_int}")
-                print(f"    XOR: key1=0x{k1:X if k1 else 0}, key2=0x{k2:X if k2 else 0}, 解码={decoded}")
+                print(f"    XOR: key1=0x{k1 if k1 else 0:X}, key2=0x{k2 if k2 else 0:X}, 解码={decoded}")
             elif "name" in name.lower():
                 val = read_string(handle, addr, 32)
                 print(f"  {name}")
@@ -271,11 +271,11 @@ def main():
             elif "playerBase" in name:
                 val = read_uint(handle, addr)
                 print(f"  {name}")
-                print(f"    地址: 0x{addr:X}, 指针值: 0x{val:X if val else 0}")
+                print(f"    地址: 0x{addr:X}, 指针值: 0x{val if val else 0:X}")
                 if val and val > base_addr and val < base_addr + image_size + 0x10000000:
                     if "**" in name:
                         val2 = read_uint(handle, val)
-                        print(f"    -> 二次解引用: 0x{val2:X if val2 else 0}")
+                        print(f"    -> 二次解引用: 0x{val2 if val2 else 0:X}")
                         if val2:
                             name_at_base = read_string(handle, val2 + 256, 17)
                             hp_dec, _, _, _ = read_xor_value(handle, val2 + 24)
