@@ -135,18 +135,26 @@ VERSIONS = {
     "cg_item_6000": {
         "description": "魔力宝贝 item_6000 版本 (最常见)",
         "window_class": "魔力宝贝",
-        "player_base_offset": 0xE12C30,     # g_playerBase_cgitem (直接指针)
-        "is_player_base_ptr_to_ptr": False,  # 直接指针，不是指针的指针
-        "is_ingame_offset": 0xBDBA78,        # g_is_ingame
-        "player_name_offset": 0xBDB998,      # g_player_name
+        "player_base_offset": 0xE12C30,
+        "is_player_base_ptr_to_ptr": False,
+        "is_ingame_offset": 0xBDBA78,
+        "player_name_offset": 0xBDB998,
+        "world_status_type": "int",
+        "world_status_offset": 0xE1E000,
+        "game_status_type": "int",
+        "game_status_offset": 0xE1DFFC,
     },
     "cg_se_3000": {
         "description": "魔力宝贝 se_3000 版本",
         "window_class": "魔力宝贝",
-        "player_base_offset": 0xCAEF88,      # g_playerBase (指针的指针)
-        "is_player_base_ptr_to_ptr": True,    # playerbase_t** 需要两次解引用
-        "is_ingame_offset": 0xA15190,         # g_is_ingame
-        "player_name_offset": 0xA150B0,       # g_player_name
+        "player_base_offset": 0xCAEF88,
+        "is_player_base_ptr_to_ptr": True,
+        "is_ingame_offset": 0xA15190,
+        "player_name_offset": 0xA150B0,
+        "world_status_type": "xor",
+        "world_status_offset": 0xC0C350,
+        "game_status_type": "xor",
+        "game_status_offset": 0xC0C360,
     },
 }
 
@@ -573,17 +581,48 @@ def main():
     print(f"  找到进程 PID={pid}, 基址=0x{base_addr:X}")
 
     is_ingame_addr = base_addr + config["is_ingame_offset"]
-    ingame = read_int(handle, is_ingame_addr)
-    print(f"  在线状态: {'已进入游戏' if ingame else '未进入游戏'}")
+    ingame_val = read_int(handle, is_ingame_addr)
 
-    if not ingame:
-        print("\n  [!] 角色尚未进入游戏，请先登录并选择角色")
-        print("  脚本将每5秒检测一次，等待进入游戏...")
+    if config.get("world_status_type") == "xor":
+        world_status = read_xor_value(handle, base_addr + config["world_status_offset"])
+    else:
+        world_status = read_int(handle, base_addr + config["world_status_offset"])
+
+    if config.get("game_status_type") == "xor":
+        game_status = read_xor_value(handle, base_addr + config["game_status_offset"])
+    else:
+        game_status = read_int(handle, base_addr + config["game_status_offset"])
+
+    player_name = read_string(handle, base_addr + config["player_name_offset"], 17)
+
+    print(f"  诊断信息:")
+    print(f"    is_ingame    = {ingame_val}")
+    print(f"    world_status = {world_status}")
+    print(f"    game_status  = {game_status}")
+    print(f"    player_name  = '{player_name}'")
+
+    is_really_ingame = (ingame_val is not None and ingame_val != 0
+                        and world_status is not None and world_status != 11 and world_status != 2)
+    print(f"    综合判断在线 = {is_really_ingame}")
+
+    if not is_really_ingame:
+        print(f"\n  [!] 角色尚未进入游戏，请先登录并选择角色")
+        print(f"  脚本将每5秒检测一次，等待进入游戏...")
 
     try:
         while True:
-            ingame = read_int(handle, is_ingame_addr)
-            if not ingame:
+            ingame_val = read_int(handle, is_ingame_addr)
+            if config.get("world_status_type") == "xor":
+                world_status = read_xor_value(handle, base_addr + config["world_status_offset"])
+            else:
+                world_status = read_int(handle, base_addr + config["world_status_offset"])
+
+            is_really_ingame = (ingame_val is not None and ingame_val != 0
+                                and world_status is not None and world_status != 11 and world_status != 2)
+
+            if not is_really_ingame:
+                os.system('cls' if os.name == 'nt' else 'clear')
+                print(f"等待进入游戏... is_ingame={ingame_val}, world_status={world_status}")
                 time.sleep(5)
                 continue
 
