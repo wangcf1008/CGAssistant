@@ -19,6 +19,11 @@ CGAssistant 交互式内存搜索器
   e) 再次搜索 150
   f) 重复直到只剩1-2个地址
   g) 用"查看"命令确认正确地址
+  h) 用菜单 10 "指针扫描" 把该(堆)地址变成稳定的 基址+偏移
+  i) 重启游戏后用菜单 11 验证，能读出正确值的那条链即可写进读取脚本
+
+为什么需要菜单10：直接搜到的地址在堆里，每次重启游戏都会变。
+而"EXE主模块内的全局指针 + 偏移"每次启动位置固定，才是可长期使用的读取路径。
 """
 
 import ctypes
@@ -306,6 +311,117 @@ def load_results():
     print(f"  已加载: {data.get('label', '')} ({data['count']}个地址, {data.get('timestamp', '')})")
     return data['addresses'], data.get('values', []), data['data_type'], data.get('label', '')
 
+# =============================================
+# 指针扫描：把易变的堆地址变成稳定的"基址+偏移"
+# =============================================
+POINTER_FILE = "pointer_results.json"
+
+def get_module_regions(handle, module_base):
+    """枚举游戏主模块(EXE)自身占用的可读内存区域。
+    全局指针(如 g_playerBase)就存放在这些区域里，地址每次启动都固定。"""
+    regions = []
+    addr = module_base
+    while addr < module_base + 0x4000000:
+        mbi = MEMORY_BASIC_INFORMATION()
+        if VirtualQueryEx(handle, addr, ctypes.byref(mbi), ctypes.sizeof(mbi)) == 0:
+            break
+        base = mbi.BaseAddress if mbi.BaseAddress is not None else addr
+        if mbi.AllocationBase is not None and mbi.AllocationBase != module_base:
+            break
+        if mbi.State == MEM_COMMIT and is_readable(mbi.Protect):
+            regions.append((base, mbi.RegionSize))
+        if mbi.RegionSize == 0:
+            break
+        addr = base + mbi.RegionSize
+    return regions
+
+def find_pointer_hits(handle, regions, target, max_offset, min_val=0x10000, limit=100000):
+    """在给定区域内查找所有满足 p + off == target 的4字节指针 p。
+    返回 [(指针所在地址, p的值, off)]。"""
+    lo = target - max_offset
+    hits = []
+    for base, size in regions:
+        data = read_mem(handle, base, size)
+        if data is None:
+            continue
+        n = len(data) - (len(data) % 4)
+        for idx, (v,) in enumerate(struct.iter_unpack('<I', data[:n])):
+            if lo <= v <= target and v >= min_val:
+                hits.append((base + idx * 4, v, target - v))
+                if len(hits) >= limit:
+                    return hits
+    return hits
+
+def in_regions(addr, regions):
+    for b, s in regions:
+        if b <= addr < b + s:
+            return True
+    return False
+
+def pointer_scan(handle, module_regions, all_regions, target, max_offset, max_level):
+    """多级指针扫描，从目标值向上(朝基址方向)逐级回溯。
+
+    每一级都在全部内存中查找"指向上一级地址"的指针：
+      - 若指针本身位于EXE主模块内，说明它是全局变量，地址每次启动都固定，
+        这就是我们要的'稳定根'，记入结果。
+      - 若指针位于堆中，则它不稳定，继续向上回溯(若还没到最大层级)。
+    返回 [(基址, [偏移1, 偏移2, ...])]，读取语义见 read_chain。
+    """
+    results = []
+    frontier = [(target, [])]
+    for level in range(1, max_level + 1):
+        new_frontier = []
+        for tgt, tail in frontier:
+            hits = find_pointer_hits(handle, all_regions, tgt, max_offset)
+            print(f"    第 {level} 级: 指向 0x{tgt:08X} 的候选指针 {len(hits)} 个")
+            for addr, p, off in hits:
+                chain = [off] + tail
+                if in_regions(addr, module_regions):
+                    results.append((addr, chain))          # 稳定根(在EXE内)
+                elif level < max_level:
+                    new_frontier.append((addr, chain))     # 堆内指针，继续回溯
+                if len(results) + len(new_frontier) >= 20000:
+                    print("    候选过多，已截断。请缩小偏移范围或降低层级。")
+                    return results
+        frontier = new_frontier
+        if not frontier:
+            break
+    return results
+
+def read_chain(handle, base_addr, offsets):
+    """按指针链读取：返回 (最终地址, 值)。失败返回 (None, None)。"""
+    p = read_int(handle, base_addr)
+    if p is None or p < 0x10000:
+        return None, None
+    cur = p
+    for i, off in enumerate(offsets):
+        cur = cur + off
+        if i != len(offsets) - 1:
+            p = read_int(handle, cur)
+            if p is None or p < 0x10000:
+                return None, None
+            cur = p
+    return cur, read_int(handle, cur)
+
+def save_pointer_results(results, base_addr, target, label):
+    data = {
+        'label': label,
+        'target': target,
+        'module_base': base_addr,
+        'chains': [{'base': b, 'base_offset': b - base_addr, 'offsets': o} for b, o in results],
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    with open(POINTER_FILE, 'w') as f:
+        json.dump(data, f)
+    print(f"  已保存 {len(results)} 条指针链到 {POINTER_FILE}")
+
+def load_pointer_results():
+    if not os.path.exists(POINTER_FILE):
+        print(f"  文件 {POINTER_FILE} 不存在")
+        return None
+    with open(POINTER_FILE, 'r') as f:
+        return json.load(f)
+
 def main():
     print("=" * 65)
     print("  CGAssistant 交互式内存搜索器")
@@ -343,6 +459,11 @@ def main():
 
     print(f"  游戏进程 PID={pid}, 基址=0x{base_addr:X}")
 
+    module_regions = get_module_regions(handle, base_addr)
+    mod_size = sum(s for _, s in module_regions)
+    print(f"  主模块可读区域: {len(module_regions)} 段, 共 {mod_size // 1024} KB (全局指针扫描范围)")
+    all_regions = get_memory_regions(handle)
+
     current_addrs = []
     current_values = []
     current_type = 'int'
@@ -361,6 +482,8 @@ def main():
         print(f"  7. 保存结果")
         print(f"  8. 加载结果")
         print(f"  9. 读取地址的当前值 (int/short/string)")
+        print(f"  10. 指针扫描 (把易变堆地址变成稳定的 基址+偏移)")
+        print(f"  11. 验证指针链 (游戏重启后确认是否依然有效)")
         print(f"  0. 退出")
 
         choice = input("\n  请选择: ").strip()
@@ -520,6 +643,90 @@ def main():
             print(f"    string: '{v_str}'")
             if data:
                 print(f"    hex: {data.hex()}")
+
+        elif choice == '10':
+            # 确定目标地址：优先用当前搜索结果中的第一个，否则手动输入
+            if current_addrs:
+                print(f"  当前结果第1个地址: 0x{current_addrs[0]:08X} (标签: {current_label or '无'})")
+                use_it = input("  使用该地址? (y=是 / n=手动输入): ").strip().lower()
+                if use_it == 'y':
+                    target = current_addrs[0]
+                else:
+                    target = None
+            else:
+                target = None
+
+            if target is None:
+                addr_str = input("  输入目标地址 (十六进制, 如 1D4CF8): ").strip()
+                try:
+                    target = int(addr_str, 16)
+                except ValueError:
+                    print("  无效地址")
+                    continue
+
+            off_str = input("  最大偏移范围 (十六进制, 默认2000): ").strip()
+            try:
+                max_offset = int(off_str, 16) if off_str else 0x2000
+            except ValueError:
+                max_offset = 0x2000
+
+            lvl_str = input("  最大层级 (1-3, 默认2): ").strip()
+            try:
+                max_level = int(lvl_str) if lvl_str else 2
+            except ValueError:
+                max_level = 2
+            max_level = max(1, min(3, max_level))
+
+            label = input("  标签 (如HP, 回车跳过): ").strip() or current_label
+
+            print(f"\n  正在回溯 0x{target:08X} 的指针链 (偏移范围 0x{max_offset:X}, 最多{max_level}级, 全内存扫描, 请稍候)...")
+            results = pointer_scan(handle, module_regions, all_regions, target, max_offset, max_level)
+
+            if not results:
+                print("  未找到任何指针链。可能该地址不是堆对象，或偏移范围太小。")
+                continue
+
+            # 只展示解析后能读到合理值的链
+            valid = []
+            for b, chain in results:
+                final_addr, val = read_chain(handle, b, chain)
+                if final_addr is not None:
+                    valid.append((b, chain, final_addr, val))
+
+            print(f"\n  共 {len(results)} 条链，其中可解析 {len(valid)} 条:")
+            show = valid[:40]
+            for b, chain, final_addr, val in show:
+                chain_str = ''.join(f"+0x{o:X}" for o in chain)
+                print(f"    [0x{b - base_addr:08X}]{chain_str} -> 0x{final_addr:08X} = {val}")
+            if len(valid) > len(show):
+                print(f"    ... 其余 {len(valid)-len(show)} 条已省略 (全部会保存到文件)")
+
+            if valid:
+                save_pointer_results([(b, c) for b, c, _, _ in valid], base_addr, target, label)
+                print("\n  提示: 重启游戏后使用菜单 11 验证，能读到合理值的那条即为稳定指针链。")
+
+        elif choice == '11':
+            data = load_pointer_results()
+            if not data:
+                continue
+
+            chains = data.get('chains', [])
+            print(f"  标签: {data.get('label','')} | 原目标: 0x{data.get('target',0):08X} | 共 {len(chains)} 条链")
+            print(f"  当前模块基址: 0x{base_addr:X} (原: 0x{data.get('module_base',0):X})")
+
+            alive = 0
+            shown = 0
+            for c in chains:
+                base = c['base_offset'] + base_addr  # 按模块相对偏移重建，兼容ASLR
+                final_addr, val = read_chain(handle, base, c['offsets'])
+                if final_addr is not None:
+                    alive += 1
+                    if shown < 40:
+                        chain_str = ''.join(f"+0x{o:X}" for o in c['offsets'])
+                        print(f"    [0x{base - base_addr:08X}]{chain_str} -> 0x{final_addr:08X} = {val}")
+                        shown += 1
+            print(f"\n  有效链: {alive} / {len(chains)}")
+            print("  若某条链读出的值等于你当前的HP/MP等数值，则它就是稳定的读取路径。")
 
         elif choice == '0':
             break
